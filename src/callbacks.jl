@@ -56,6 +56,12 @@ has_continuous_callback(cb::Nothing) = false
 # Callback handling
 #======================================================#
 
+condition_is_active(out) = (out, true) # no flag is set
+condition_is_active(out::T) where {T <: Tuple} = out # flag is set
+
+condition_is_active(out, ::Any) = true # no flags are set
+condition_is_active(out, is_active::T) where {N, T <: NTuple{N, Bool}} = is_active # flags are set
+
 function get_tmp(integrator::DEIntegrator, callback)
     _tmp = get_tmp_cache(integrator)
     _tmp === nothing && return nothing
@@ -108,12 +114,15 @@ function get_condition(integrator::DEIntegrator, callback, abst)
     end
     integrator.sol.destats.ncondition += 1
     if callback isa VectorContinuousCallback
-        callback.condition(@view(integrator.callback_cache.tmp_condition[1:(callback.len)]),
-                           tmp, abst, integrator)
-        return @view(integrator.callback_cache.tmp_condition[1:(callback.len)])
+        _is_active = callback.condition(@view(integrator.callback_cache.tmp_condition[1:(callback.len)]),
+                                        tmp, abst, integrator)
+        out = @view(integrator.callback_cache.tmp_condition[1:(callback.len)])
+
+        is_active = condition_is_active(out, _is_active)
     else
-        return callback.condition(tmp, abst, integrator)
+        out, is_active = condition_is_active(callback.condition(tmp, abst, integrator))
     end
+    return out, is_active
 end
 
 # Use Recursion to find the first callback for type-stability
@@ -180,12 +189,12 @@ end
     previous_condition = @views(integrator.callback_cache.previous_condition[1:(callback.len)])
 
     if callback.idxs === nothing
-        callback.condition(previous_condition, integrator.uprev, integrator.tprev,
-                           integrator)
+        uprev = integrator.uprev
     else
-        callback.condition(previous_condition, integrator.uprev[callback.idxs],
-                           integrator.tprev, integrator)
+        @views uprev = integrator.uprev[callback.idxs]
     end
+    _is_active = callback.condition(previous_condition, uprev, integrator.tprev, integrator)
+    previous_is_active = condition_is_active(previous_condition, _is_active)
     integrator.sol.destats.ncondition += 1
 
     ivec = integrator.vector_event_last_time
@@ -212,33 +221,44 @@ end
 
         # Evaluate condition slightly in future
         abst = integrator.tprev + integrator.dt * callback.repeat_nudge
-        tmp_condition = get_condition(integrator, callback, abst)
+        tmp_condition, tmp_is_active = get_condition(integrator, callback, abst)
         @. prev_sign = sign(previous_condition)
         prev_sign[ivec] = sign(tmp_condition[ivec])
+        if previous_is_active isa Tuple
+            prev_is_active = ntuple((i -> in(i, ivec) ? tmp_is_active[i] :
+                                          previous_is_active[i]),
+                                    length(previous_is_active))
+        else
+            prev_is_active = previous_is_active
+        end
     else
         @. prev_sign = sign(previous_condition)
+        prev_is_active = previous_is_active
     end
 
     prev_sign_index = 1
     abst = integrator.t
-    next_condition = get_condition(integrator, callback, abst)
+    next_condition, next_is_active = get_condition(integrator, callback, abst)
     @. next_sign = sign(next_condition)
 
     event_idx = findall_events!(next_sign, callback.affect!, callback.affect_neg!,
-                                prev_sign)
+                                prev_sign, prev_is_active, next_is_active)
     if sum(event_idx) != 0
         event_occurred = true
         interp_index = callback.interp_points
     end
 
     if callback.interp_points != 0 && !isdiscrete(integrator.alg) &&
-       sum(event_idx) != length(event_idx) # Use the interpolants for safety checking
+       sum(event_idx) !=
+       possible_active_events(event_idx, prev_is_active, next_is_active) # Use the interpolants for safety checking
         fallback = true
+        _prev_is_active = prev_is_active
         for i in 2:length(ts)
             abst = ts[i]
-            copyto!(next_sign, get_condition(integrator, callback, abst))
+            _next_sign, next_is_active = get_condition(integrator, callback, abst)
+            copyto!(next_sign, _next_sign)
             _event_idx = findall_events!(next_sign, callback.affect!, callback.affect_neg!,
-                                         prev_sign)
+                                         prev_sign, _prev_is_active, next_is_active)
             if sum(_event_idx) != 0
                 event_occurred = true
                 event_idx = _event_idx
@@ -246,6 +266,7 @@ end
                 fallback = false
                 break
             else
+                _prev_is_active = next_is_active
                 prev_sign_index = i
             end
         end
@@ -255,10 +276,10 @@ end
             # non-interpolated version
 
             abst = integrator.t
-            next_condition = get_condition(integrator, callback, abst)
+            next_condition, next_is_active = get_condition(integrator, callback, abst)
             @. next_sign = sign(next_condition)
             event_idx = findall_events!(next_sign, callback.affect!, callback.affect_neg!,
-                                        prev_sign)
+                                        prev_sign, prev_is_active, next_is_active)
             interp_index = callback.interp_points
         end
     end
@@ -289,12 +310,13 @@ end
 
     # Check if the event occured
     if callback.idxs === nothing
-        previous_condition = callback.condition(integrator.uprev, integrator.tprev,
-                                                integrator)
+        uprev = integrator.uprev
     else
-        @views previous_condition = callback.condition(integrator.uprev[callback.idxs],
-                                                       integrator.tprev, integrator)
+        @views uprev = integrator.uprev[callback.idxs]
     end
+    previous_out = callback.condition(uprev, integrator.tprev, integrator)
+    previous_condition, previous_is_active = condition_is_active(previous_out)
+
     integrator.sol.destats.ncondition += 1
 
     prev_sign = 0.0
@@ -319,26 +341,30 @@ end
 
         # Evaluate condition slightly in future
         abst = integrator.tprev + integrator.dt * callback.repeat_nudge
-        tmp_condition = get_condition(integrator, callback, abst)
+        tmp_condition, tmp_is_active = get_condition(integrator, callback, abst)
         prev_sign = sign(tmp_condition)
+        prev_is_active = tmp_is_active
     else
         prev_sign = sign(previous_condition)
+        prev_is_active = previous_is_active
     end
 
     prev_sign_index = 1
     abst = integrator.t
-    next_condition = get_condition(integrator, callback, abst)
+    next_condition, next_is_active = get_condition(integrator, callback, abst)
     next_sign = sign(next_condition)
 
-    if ((prev_sign < 0 && callback.affect! !== nothing) ||
+    if (prev_is_active && next_is_active) &&
+       ((prev_sign < 0 && callback.affect! !== nothing) ||
         (prev_sign > 0 && callback.affect_neg! !== nothing)) && prev_sign * next_sign <= 0
         event_occurred = true
         interp_index = callback.interp_points
     elseif callback.interp_points != 0 && !isdiscrete(integrator.alg) # Use the interpolants for safety checking
         for i in 2:length(ts)
             abst = ts[i]
-            new_sign = get_condition(integrator, callback, abst)
-            if ((prev_sign < 0 && callback.affect! !== nothing) ||
+            new_sign, new_is_active = get_condition(integrator, callback, abst)
+            if (prev_is_active && new_is_active) &&
+               ((prev_sign < 0 && callback.affect! !== nothing) ||
                 (prev_sign > 0 && callback.affect_neg! !== nothing)) &&
                prev_sign * new_sign < 0
                 event_occurred = true
@@ -346,6 +372,7 @@ end
                 break
             else
                 prev_sign_index = i
+                prev_is_active = new_is_active
             end
         end
     end
@@ -371,27 +398,61 @@ function bisection(f, tup, t_forward::Bool, rootfind::SciMLBase.RootfindOpt, abs
 end
 
 """
-findall_events!(next_sign,affect!,affect_neg!,prev_sign)
+findall_events!(next_sign,affect!,affect_neg!,prev_sign,prev_is_active,next_is_active)
 
 Modifies `next_sign` to be an array of booleans for if there is a sign change
 in the interval between prev_sign and next_sign
 """
 function findall_events!(next_sign::Union{Array, SubArray}, affect!::F1, affect_neg!::F2,
-                         prev_sign::Union{Array, SubArray}) where {F1, F2}
+                         prev_sign::Union{Array, SubArray}, prev_is_active,
+                         next_is_active) where {F1, F2}
     @inbounds for i in 1:length(prev_sign)
         next_sign[i] = ((prev_sign[i] < 0 && affect! !== nothing) ||
                         (prev_sign[i] > 0 && affect_neg! !== nothing)) &&
                        prev_sign[i] * next_sign[i] <= 0
     end
-    next_sign
+
+    remove_inactive_events!(next_sign, prev_is_active, next_is_active)
+    return next_sign
 end
 
-function findall_events!(next_sign, affect!::F1, affect_neg!::F2, prev_sign) where {F1, F2}
+function findall_events!(next_sign, affect!::F1, affect_neg!::F2, prev_sign, prev_is_active,
+                         next_is_active) where {F1, F2}
     hasaffect::Bool = affect! !== nothing
     hasaffectneg::Bool = affect_neg! !== nothing
     f = (n, p) -> ((p < 0 && hasaffect) || (p > 0 && hasaffectneg)) && p * n <= 0
-    A = map!(f, next_sign, next_sign, prev_sign)
-    next_sign
+    map!(f, next_sign, next_sign, prev_sign)
+
+    remove_inactive_events!(next_sign, prev_is_active, next_is_active)
+    return next_sign
+end
+
+function remove_inactive_events!(next_sign,
+                                 prev_is_active::T,
+                                 next_is_active::T) where {T <: Tuple}
+    for idx in eachindex(next_sign)
+        if !prev_is_active[idx] || !next_is_active[idx]
+            next_sign[idx] = false
+        end
+    end
+end
+
+function remove_inactive_events!(next_sign, ::T,
+                                 ::T) where {T <: Bool}
+end
+
+function possible_active_events(event_idx::T1, prev_is_active::T2,
+                                next_is_active::T2) where {T1 <: AbstractArray, T2 <: Tuple}
+    s = 0
+    for idx in eachindex(event_idx)
+        s += prev_is_active[idx] * next_is_active[idx]
+    end
+    return s
+end
+
+function possible_active_events(event_idx::T1, ::T2,
+                                ::T2) where {T1 <: AbstractArray, T2 <: Bool}
+    return length(event_idx)
 end
 
 function find_callback_time(integrator, callback::ContinuousCallback, counter)
@@ -410,7 +471,7 @@ function find_callback_time(integrator, callback::ContinuousCallback, counter)
                 bottom_t = integrator.tprev
             end
             if callback.rootfind != SciMLBase.NoRootFind && !isdiscrete(integrator.alg)
-                zero_func(abst, p = nothing) = get_condition(integrator, callback, abst)
+                zero_func(abst, p = nothing) = get_condition(integrator, callback, abst)[1]
                 if zero_func(top_t) == 0
                     Θ = top_t
                 else
@@ -477,7 +538,7 @@ function find_callback_time(integrator, callback::VectorContinuousCallback, coun
                         function zero_func(abst, p = nothing)
                             ArrayInterfaceCore.allowed_getindex(get_condition(integrator,
                                                                               callback,
-                                                                              abst), idx)
+                                                                              abst)[1], idx)
                         end
                         if zero_func(top_t) == 0
                             Θ = top_t
